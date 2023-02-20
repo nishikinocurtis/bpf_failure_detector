@@ -6,6 +6,7 @@
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include <linux/errno.h>
 #include <time.h>
 #define N 5
 #define HEARTBEAT_PORT 8888
@@ -38,6 +39,7 @@ struct {
 	__uint(max_entries, 2);
 	__type(key, int);
 	__type(value, struct elem);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } timers SEC(".maps");
 
 struct {
@@ -53,12 +55,12 @@ __u32 key_to_debug = 0;
 
 static int timer_cb1(void *map, int *key, struct elem * arrElem) {
   bpf_printk("suspect that node %d is down", *key);
-  debug = (__u32*)bpf_map_lookup_elem(&debug_arr, &key_to_debug);
-  if (debug) {
-    bpf_printk("debug was %d", *debug);
-    *debug = *debug + 1;
-    bpf_map_update_elem(&debug_arr, &key_to_debug, debug, BPF_ANY);
-    bpf_printk("timer callback done, debug is %d", *debug);
+  __u32 * val = (__u32*)bpf_map_lookup_elem(&debug_arr, &key_to_debug);
+  if (val) {
+    bpf_printk("debug was %d", *val);
+    __u32 new_debug = *val + 1;
+    bpf_map_update_elem(&debug_arr, &key_to_debug, &new_debug, BPF_ANY);
+    bpf_printk("timer callback done, debug is %d", *val);
   }
   return 0;
 }
@@ -105,7 +107,7 @@ int myprogram(struct xdp_md *ctx) {
   if (udp->dest == bpf_htons(HEARTBEAT_PORT)){
     __u64 recv_time = bpf_ktime_get_ns();
     // estimated arrival time  
-    __u64* ea;
+    __u64 * ea;
     struct elem * heartbeat_timer;
 
     load = data + ipsize + sizeof(struct udphdr);
@@ -126,27 +128,40 @@ int myprogram(struct xdp_md *ctx) {
           bpf_printk("first u is : %ld", *u);
         }
         heartbeat_timer = (struct elem*)bpf_map_lookup_elem(&timers, &key_to_timer);
-        if (heartbeat_timer){
+        if (heartbeat_timer) {
           // this line of code is questionable, given that sequence is an unsigned long
-          bpf_printk("debugging");
+          bpf_printk("debugging-enter");
           bpf_printk("recv_time for sequence 0: %ld", recv_time);
-          *ea = recv_time + ((sequence+1)* DELTA)/2;
-          bpf_printk("new arrival estimate: %ld, recv_time: %ld", *ea, recv_time);
+          // *ea = recv_time + ((sequence+1)* DELTA)/2;
+          __u64 new_ea = recv_time + ((sequence+1)* DELTA)/2;
+          bpf_map_update_elem(&book_keeping, &key_to_ea, &new_ea, BPF_ANY);
+          // test
+          ea = (__u64 *)bpf_map_lookup_elem(&book_keeping, &key_to_ea);
+          if (ea)
+            bpf_printk("new arrival estimate for 0 : %ld", *ea);
+          bpf_printk(", recv_time: %ld", recv_time);
           bpf_printk("debugging");
-          bpf_timer_init(&(heartbeat_timer->timer), &timers, CLOCK_MONOTONIC);
+          if (bpf_timer_init(&(heartbeat_timer->timer), &timers, CLOCK_MONOTONIC) == -EPERM) {
+              bpf_printk("timer init error");
+          }
           bpf_timer_set_callback(&(heartbeat_timer->timer), timer_cb1);
           // bpf_timer_start(&(heartbeat_timer->timer), *ea - recv_time, 0);
-          bpf_timer_start(&(heartbeat_timer->timer), 1, 0);
-
+          if (bpf_timer_start(&(heartbeat_timer->timer), 1000, 0) != 0) {
+              bpf_printk("timer starting error");
+          };
+          bpf_printk("timer set");
         }
-      }else if (sequence < N) {
+
+        bpf_printk("0-branch-exiting");
+      }
+      else if (sequence < N) {
         __u64 * u;
         bpf_map_push_elem(&recent_arrival, &recv_time, BPF_EXIST);
         bpf_map_update_elem(&book_keeping, &key_to_k, &sequence, BPF_ANY);
         u = (__u64*)bpf_map_lookup_elem(&book_keeping, &key_to_u);
-        ea = (__u64*)bpf_map_lookup_elem(&book_keeping, &key_to_ea);
+        ea = (__u64 *) bpf_map_lookup_elem(&book_keeping, &key_to_ea);
         heartbeat_timer = (struct elem*)bpf_map_lookup_elem(&timers, &key_to_timer);
-        if (u && ea && heartbeat_timer){
+        if (u && ea && heartbeat_timer) {
           bpf_printk("old u is: %ld", *u);
           *u = recv_time/(sequence+1) +  (*u) * sequence / (sequence+1);
           // *ea = (__u64) (*u + (float)((sequence+1)* DELTA)/2);
@@ -167,6 +182,8 @@ int myprogram(struct xdp_md *ctx) {
         bpf_map_pop_elem(&recent_arrival, &old_arrival_time);
         bpf_map_push_elem(&recent_arrival, &recv_time, BPF_ANY);
         ea = (__u64*)bpf_map_lookup_elem(&book_keeping, &key_to_ea);
+
+        bpf_printk("default-entering");
         
         if (ea) {
           *ea = *ea + (recv_time - (old_arrival_time))/N;
