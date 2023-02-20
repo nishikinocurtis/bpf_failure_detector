@@ -39,7 +39,7 @@ struct {
 	__uint(max_entries, 2);
 	__type(key, int);
 	__type(value, struct elem);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __uint(pinning, LIBBPF_PIN_BY_NAME); // if you check bgp_helper_defs.h: -PERM errno requires the timer map to be pinned
 } timers SEC(".maps");
 
 struct {
@@ -56,7 +56,7 @@ __u32 key_to_debug = 0;
 static int timer_cb1(void *map, int *key, struct elem * arrElem) {
   bpf_printk("suspect that node %d is down", *key);
   __u32 * val = (__u32*)bpf_map_lookup_elem(&debug_arr, &key_to_debug);
-  if (val) {
+  if (val) { // seems access to global pointer is invalid: report by libbpf loader, changes to local
     bpf_printk("debug was %d", *val);
     __u32 new_debug = *val + 1;
     bpf_map_update_elem(&debug_arr, &key_to_debug, &new_debug, BPF_ANY);
@@ -132,10 +132,12 @@ int myprogram(struct xdp_md *ctx) {
           // this line of code is questionable, given that sequence is an unsigned long
           bpf_printk("debugging-enter");
           bpf_printk("recv_time for sequence 0: %ld", recv_time);
-          // *ea = recv_time + ((sequence+1)* DELTA)/2;
+          // OLD: *ea = recv_time + ((sequence+1)* DELTA)/2;
+          // comments: here, the ea is used without initializing!!! dangerous
+          // and it causes errors when compiling, LLVM directly omits all codes following
+          // hint: use llvm-objdump to check whether the bytecodes are as desired.
           __u64 new_ea = recv_time + ((sequence+1)* DELTA)/2;
           bpf_map_update_elem(&book_keeping, &key_to_ea, &new_ea, BPF_ANY);
-          // test
           ea = (__u64 *)bpf_map_lookup_elem(&book_keeping, &key_to_ea);
           if (ea)
             bpf_printk("new arrival estimate for 0 : %ld", *ea);
